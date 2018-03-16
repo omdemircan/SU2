@@ -42,7 +42,7 @@ COutput::COutput(CConfig *config) {
   rank = SU2_MPI::GetRank();
   size = SU2_MPI::GetSize();
 
-	unsigned short iDim, iSpan, iMarker;
+  unsigned short iDim, iZone, iSpan, iMarker;
   
   /*--- Initialize point and connectivity counters to zero. ---*/
   
@@ -130,7 +130,8 @@ COutput::COutput(CConfig *config) {
   /*--- Initialize residual ---*/
   
   RhoRes_New = EPS;
-  RhoRes_Old = EPS;
+  RhoRes_Old = new su2double[config->GetnZone()];
+  for (iZone = 0; iZone < config->GetnZone(); iZone++) RhoRes_Old[iZone] = EPS;
   
   wrote_Paraview_base = false;
 
@@ -333,6 +334,7 @@ COutput::~COutput(void) {
       delete [] TotalStaticEfficiency[iMarker];
       delete [] TotalTotalEfficiency [iMarker];
       delete [] KineticEnergyLoss    [iMarker];
+      delete [] TRadius              [iMarker];
       delete [] TotalPressureLoss    [iMarker];
       delete [] MassFlowIn           [iMarker];
       delete [] MassFlowOut          [iMarker];
@@ -349,6 +351,7 @@ COutput::~COutput(void) {
       delete [] FlowAngleIn_BC       [iMarker];
       delete [] EntropyIn            [iMarker];
       delete [] EntropyIn_BC         [iMarker];
+      delete [] EntropyOut           [iMarker];
       delete [] TotalEnthalpyIn_BC   [iMarker];
       delete [] DensityIn            [iMarker];
       delete [] PressureIn           [iMarker];
@@ -383,6 +386,7 @@ COutput::~COutput(void) {
     delete [] TotalStaticEfficiency;
     delete [] TotalTotalEfficiency;
     delete [] KineticEnergyLoss;
+    delete [] TRadius;
     delete [] TotalPressureLoss;
     delete [] MassFlowIn;
     delete [] MassFlowOut;
@@ -399,6 +403,7 @@ COutput::~COutput(void) {
     delete [] FlowAngleIn_BC;
     delete [] EntropyIn;
     delete [] EntropyIn_BC;
+    delete [] EntropyOut;
     delete [] TotalEnthalpyIn_BC;
     delete [] DensityIn;
     delete [] PressureIn;
@@ -415,6 +420,7 @@ COutput::~COutput(void) {
     delete [] MachOut;
     delete [] TurboVelocityIn;
     delete [] TurboVelocityOut;
+    delete [] TemperatureIn;
     delete [] TemperatureOut;
     delete [] TotalPressureIn;
     delete [] TotalPressureOut;
@@ -4663,7 +4669,6 @@ void COutput::MergeSolution_FEM(CConfig *config, CGeometry *geometry, CSolver **
   /*--- Prepare send buffers for the conservative variables. Need to
    find the total number of conservative variables and also the
    index for their particular solution container. ---*/
-  
   switch (Kind_Solver) {
     case FEM_EULER : case FEM_NAVIER_STOKES: case FEM_LES: FirstIndex = FLOW_SOL; SecondIndex = NONE; ThirdIndex = NONE; break;
     default: SecondIndex = NONE; ThirdIndex = NONE; break;
@@ -5381,7 +5386,6 @@ void COutput::SetRestart(CConfig *config, CGeometry *geometry, CSolver **solver,
         restart_file << "\t\"CrossTerm_1\"\t\"CrossTerm_2\"\t\"CrossTerm_3\"";
     }
 
-    
     if (config->GetExtraOutput()) {
       string *headings = NULL;
       //if (Kind_Solver == RANS) {
@@ -5883,7 +5887,23 @@ void COutput::SetConvHistory_Body(ofstream *ConvHist_file,
     
 
     unsigned short direct_diff = config[val_iZone]->GetDirectDiff();
-    
+
+    long ExtraHeatOutputZone = config[val_iZone]->GetExtraHeatOutputZone() - 1;
+    bool extra_heat_output = false;
+    su2double Extra_Total_Heat = 0.0;
+    su2double Extra_Heat_Residual = 0.0;
+
+    if (ExtraHeatOutputZone > -1) {
+      if (ExtraHeatOutputZone > nZone) {
+        SU2_MPI::Error("Error in output routine: Extra output zone number exceeds total number of zones.", CURRENT_FUNCTION);
+      }
+      else if ((config[ExtraHeatOutputZone]->GetKind_Solver() != HEAT_EQUATION) && (config[ExtraHeatOutputZone]->GetKind_Solver() != HEAT_EQUATION_FVM)) {
+        SU2_MPI::Error("Error in output routine: No heat solver in extra output zone.", CURRENT_FUNCTION);
+      }
+      else {
+        extra_heat_output = true;
+      }
+    }
     
     /*--- Initialize variables to store information from all domains (direct solution) ---*/
     
@@ -6258,7 +6278,12 @@ void COutput::SetConvHistory_Body(ofstream *ConvHist_file,
 
 
     }
-    
+
+    if (extra_heat_output) {
+      Extra_Total_Heat      = solver_container[ExtraHeatOutputZone][FinestMesh][HEAT_SOL]->GetTotal_HeatFlux();
+      Extra_Heat_Residual   = log10(solver_container[ExtraHeatOutputZone][FinestMesh][HEAT_SOL]->GetRes_RMS(0));
+    }
+
     /*--- Header frequency ---*/
     
     bool Unsteady = ((config[val_iZone]->GetUnsteady_Simulation() == DT_STEPPING_1ST) ||
@@ -6993,6 +7018,8 @@ void COutput::SetConvHistory_Body(ofstream *ConvHist_file,
                 cout.width(15); cout << aeroelastic_pitch[0];
                 cout.unsetf(ios_base::floatfield);
               }
+
+              if (extra_heat_output) { cout.width(15); cout << Extra_Heat_Residual; cout.width(15); cout << Extra_Total_Heat; }
             }
             cout << endl;
           }
@@ -7082,6 +7109,8 @@ void COutput::SetConvHistory_Body(ofstream *ConvHist_file,
                 cout.width(15); cout << aeroelastic_pitch[0];
                 cout.unsetf(ios_base::floatfield);
               }
+
+              if (extra_heat_output) { cout.width(15); cout << Extra_Heat_Residual; cout.width(15); cout << Extra_Total_Heat; }
               cout << endl;
             }
           }
@@ -7291,19 +7320,28 @@ void COutput::SetCFL_Number(CSolver ****solver_container, CConfig **config, unsi
   
   unsigned short FinestMesh = config[val_iZone]->GetFinestMesh();
   unsigned long ExtIter = config[val_iZone]->GetExtIter();
-  
-  RhoRes_New = solver_container[val_iZone][FinestMesh][FLOW_SOL]->GetRes_RMS(0);
+
+  bool weakly_coupled_heat = config[val_iZone]->GetWeakly_Coupled_Heat();
+
   switch( config[val_iZone]->GetKind_Solver()) {
+    case EULER : case NAVIER_STOKES : case RANS:
+    case FEM_EULER : case FEM_NAVIER_STOKES: case FEM_RANS: case FEM_LES:
+      RhoRes_New = solver_container[val_iZone][FinestMesh][FLOW_SOL]->GetRes_RMS(0);
+      if (weakly_coupled_heat) RhoRes_New = solver_container[val_iZone][FinestMesh][HEAT_SOL]->GetRes_RMS(0);
+      break;
     case ADJ_EULER : case ADJ_NAVIER_STOKES: case ADJ_RANS:
       RhoRes_New = solver_container[val_iZone][FinestMesh][ADJFLOW_SOL]->GetRes_RMS(0);
+      break;
+    case HEAT_EQUATION: case HEAT_EQUATION_FVM:
+      RhoRes_New = solver_container[val_iZone][FinestMesh][HEAT_SOL]->GetRes_RMS(0);
       break;
   }
   
   if (RhoRes_New < EPS) RhoRes_New = EPS;
-  if (RhoRes_Old < EPS) RhoRes_Old = RhoRes_New;
+  if (RhoRes_Old[val_iZone] < EPS) RhoRes_Old[val_iZone] = RhoRes_New;
   
-  Div = RhoRes_Old/RhoRes_New;
-  Diff = RhoRes_New-RhoRes_Old;
+  Div = RhoRes_Old[val_iZone]/RhoRes_New;
+  Diff = RhoRes_New-RhoRes_Old[val_iZone];
   
   /*--- Compute MG factor ---*/
   
@@ -7344,13 +7382,19 @@ void COutput::SetCFL_Number(CSolver ****solver_container, CConfig **config, unsi
     
   }
   
-  RhoRes_Old = solver_container[val_iZone][FinestMesh][FLOW_SOL]->GetRes_RMS(0);
   switch( config[val_iZone]->GetKind_Solver()) {
-    case ADJ_EULER : case ADJ_NAVIER_STOKES: case ADJ_RANS:
-      RhoRes_Old = solver_container[val_iZone][FinestMesh][ADJFLOW_SOL]->GetRes_RMS(0);
-      break;
+  case EULER : case NAVIER_STOKES : case RANS:
+  case FEM_EULER : case FEM_NAVIER_STOKES: case FEM_RANS: case FEM_LES:
+    RhoRes_Old[val_iZone] = solver_container[val_iZone][FinestMesh][FLOW_SOL]->GetRes_RMS(0);
+    if (weakly_coupled_heat) RhoRes_Old[val_iZone] = solver_container[val_iZone][FinestMesh][HEAT_SOL]->GetRes_RMS(0);
+    break;
+  case ADJ_EULER : case ADJ_NAVIER_STOKES: case ADJ_RANS:
+    RhoRes_Old[val_iZone] = solver_container[val_iZone][FinestMesh][ADJFLOW_SOL]->GetRes_RMS(0);
+    break;
+  case HEAT_EQUATION: case HEAT_EQUATION_FVM:
+    RhoRes_Old[val_iZone] = solver_container[val_iZone][FinestMesh][HEAT_SOL]->GetRes_RMS(0);
+    break;
   }
-  
 }
 
 void COutput::SpecialOutput_ForcesBreakdown(CSolver ****solver, CGeometry ***geometry, CConfig **config, unsigned short val_iZone, bool output) {
